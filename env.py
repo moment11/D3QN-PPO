@@ -1,171 +1,207 @@
-import gym
-from gym import spaces
 import numpy as np
 from collections import deque
+import gymnasium as gym
+from gymnasium import spaces
+
 
 class EdgeComputingEnv(gym.Env):
-    def __init__(self, num_devices=30, num_edges=5, max_task_size=10.0, max_deadline=3000,
-                 
-                 R_base=50.0,
-                 P_base=20.0,
-                 w_tau=10.0,
-                 w_O=1.5,
-                 w_E=0.8,
-                 w_L=5.0,
-                 C_local=1.0,
-                 B_up=20.0,
-                 w_realtime=0.4, w_safety=0.4, w_data=0.2):
-        super(EdgeComputingEnv, self).__init__()
+    """Cloud-edge-end IIoT environment described in the paper."""
 
+    TASK_TYPE_WEIGHTS = np.asarray(
+        [[0.45, 0.45, 0.10], [0.40, 0.30, 0.30], [0.25, 0.15, 0.60]],
+        dtype=np.float32,
+    )
+
+    def __init__(self, num_devices=30, num_edges=5, max_task_size=10.0,
+                 max_deadline=3.0, max_steps_per_episode=200, seed=None,
+                 priority_weights=None):
+        super().__init__()
         self.num_devices = num_devices
         self.num_edges = num_edges
         self.max_task_size = max_task_size
         self.max_deadline = max_deadline
-        self.C_local = C_local
+        self.max_steps_per_episode = max_steps_per_episode
+        self.rng = np.random.default_rng(seed)
+        self.priority_weight_matrix = (
+            self.TASK_TYPE_WEIGHTS.copy()
+            if priority_weights is None
+            else np.tile(np.asarray(priority_weights, dtype=np.float32), (3, 1))
+        )
+        if not np.allclose(self.priority_weight_matrix.sum(axis=1), 1.0):
+            raise ValueError("Each priority weight vector must sum to one")
 
-        
-        self.R_base = R_base
-        self.P_base = P_base
-        self.w_tau = w_tau
-        self.w_O = w_O
-        self.w_E = w_E
-        self.w_L = w_L
+        self.time_step_duration = 0.1
+        self.bandwidth_hz = 20e6
+        self.noise_watt = 10 ** ((-100.0 - 30.0) / 10.0)
+        self.tx_power_watt = 0.2
+        self.backhaul_power_watt = 1.0
+        self.backhaul_rate_bps = 1e9
+        self.cloud_cpu_hz = 100e9
+        self.energy_coefficient = 1e-27
+        self.completion_reward = 50.0
+        self.base_overdue_penalty = 20.0
+        self.priority_weight = 10.0
+        self.delay_weight = 1.5
+        self.energy_weight = 0.8
+        self.load_balance_weight = 0.05
 
-        
-        self.C_edges = np.random.uniform(20.0, 30.0, size=num_edges)  
-        self.e_edge_p = np.random.uniform(0.1, 0.2, size=num_edges)  
-        self.B_up = B_up
-        self.e_upload = 0.05
-        self.time_step_duration = 0.1 
-
-        self.w_realtime = w_realtime
-        self.w_safety = w_safety
-        self.w_data = w_data
-        self.max_safety_level = 3
-        self.max_dependencies = 2
-        self.max_global_deadline = max_deadline
-
-        
-        self.state_dim = 3 + self.num_edges
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.state_dim,), dtype=np.float32)
-
-        self.action_space = spaces.Dict({
-            "location": spaces.Discrete(self.num_edges + 1), 
-            "continuous_params": spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        })
-
-        self.server_loads = np.zeros(self.num_edges)
+        self.edge_cpu_hz = self.rng.uniform(20e9, 30e9, size=num_edges)
+        self.edge_power_watt = self.rng.uniform(0.1, 0.2, size=num_edges)
+        self.server_loads = np.zeros(num_edges, dtype=np.float64)
+        self.channel_gains = np.ones(num_edges, dtype=np.float64)
         self.task_queue = deque()
         self.current_task = None
-        self.max_steps_per_episode = 200
         self.episode_step = 0
 
-    def reset(self):
+        # Five task/device values plus capacity, load, and channel per MEC.
+        self.state_dim = 5 + 3 * self.num_edges
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(self.state_dim,), dtype=np.float32
+        )
+        # 0..M-1 select a MEC; M selects cloud through the least-loaded MEC.
+        self.action_space = spaces.Dict({
+            "location": spaces.Discrete(self.num_edges + 1),
+            "continuous_params": spaces.Box(
+                low=0.0, high=1.0, shape=(2,), dtype=np.float32
+            ),
+        })
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
         self.episode_step = 0
-        
-        self.server_loads.fill(0)
+        self.server_loads.fill(0.0)
         self.task_queue.clear()
         self._get_next_task()
-        
+        self._refresh_channel_gains()
         return self._get_state()
-
 
     def _generate_tasks(self, num_tasks):
         for _ in range(num_tasks):
-            task_size = np.random.uniform(1.0, self.max_task_size)  #
-            deadline = np.random.uniform(0.5, 2.0) * 1000  # ms
-            safety_level = np.random.randint(1, self.max_safety_level + 1)
-            dependencies = np.random.randint(0, self.max_dependencies + 1)
-            
-            task_complexity = np.random.uniform(500, 1500)
-            deadline = np.random.uniform(0.5, 2.0) * 1000  # ms
-            
-            f_R = 1 - (deadline / self.max_global_deadline)
-            f_S = (safety_level - 1) / (self.max_safety_level - 1) if self.max_safety_level > 1 else 0
-            f_D = dependencies / self.max_dependencies if self.max_dependencies > 0 else 0
-            priority_score = np.clip(self.w_realtime * f_R + self.w_safety * f_S + self.w_data * f_D, 0, 1)
-
+            task_type = int(self.rng.integers(0, len(self.priority_weight_matrix)))
+            deadline = self.rng.uniform(0.5, min(2.0, self.max_deadline))
+            factors = np.asarray([
+                np.clip(1.0 - deadline / self.max_deadline, 0.0, 1.0),
+                self.rng.uniform(0.0, 1.0),
+                self.rng.uniform(0.0, 1.0),
+            ])
+            priority = float(np.dot(self.priority_weight_matrix[task_type], factors))
             self.task_queue.append({
-                "size": task_size,
-                "complexity": task_complexity,  
+                "size_mb": self.rng.uniform(1.0, self.max_task_size),
+                "complexity": self.rng.uniform(500.0, 1500.0),
                 "deadline": deadline,
-                "tau": priority_score,
-                "battery": np.random.uniform(0.5, 1.0) 
+                "task_type": task_type,
+                "priority": priority,
+                "battery": self.rng.uniform(0.5, 1.0),
+                "local_cpu_hz": self.rng.uniform(0.5e9, 1.5e9),
             })
+
     def _get_next_task(self):
-        """从队列中获取下一个任务"""
         if not self.task_queue:
-            self._generate_tasks(self.num_devices * 2)  
+            self._generate_tasks(self.num_devices)
         self.current_task = self.task_queue.popleft()
+
+    def _refresh_channel_gains(self):
+        distances = self.rng.uniform(10.0, 1000.0, size=self.num_edges)
+        unit_gain = 10 ** (-40.0 / 10.0)
+        self.channel_gains = unit_gain * distances ** -2
+
     def _get_state(self):
-        
-        channel_gains = np.random.uniform(0.5, 1.0, size=self.num_edges)
-        norm_task_size = self.current_task["size"] / self.max_task_size
-        norm_deadline = self.current_task["deadline"] / self.max_global_deadline
-        norm_tau = self.current_task["tau"]
-        norm_battery = self.current_task["battery"]  
-        
-        norm_server_loads = np.clip(self.server_loads / (self.C_edges * 10 + 1e-6), 0, 1)
+        task = self.current_task
+        normalized_loads = np.clip(
+            self.server_loads / (self.edge_cpu_hz * self.time_step_duration),
+            0.0,
+            1.0,
+        )
+        normalized_channels = self.channel_gains / (self.channel_gains + 1e-10)
         return np.concatenate([
-            [norm_task_size, norm_deadline, norm_tau, norm_battery],
-            norm_server_loads,
-            channel_gains
+            [task["size_mb"] / self.max_task_size,
+             task["complexity"] / 1500.0,
+             task["priority"],
+             task["battery"],
+             task["local_cpu_hz"] / 1.5e9],
+            self.edge_cpu_hz / 30e9,
+            normalized_loads,
+            normalized_channels,
         ]).astype(np.float32)
 
     def step(self, action):
-        
-        work_done = self.C_edges * self.time_step_duration * 100  
-        self.server_loads = np.maximum(0, self.server_loads - work_done)
+        if self.episode_step % self.num_devices == 0:
+            self.server_loads = np.maximum(
+                0.0,
+                self.server_loads - self.edge_cpu_hz * self.time_step_duration,
+            )
+        location = int(action["location"])
+        if not self.action_space["location"].contains(location):
+            raise ValueError(f"Invalid location action: {location}")
+        alpha, beta = np.clip(
+            np.asarray(action["continuous_params"], dtype=np.float64), 0.0, 1.0
+        )
 
-        
-        location = action["location"]
-        alpha = (action["continuous_params"][0] + 1) / 2
-        beta = (action["continuous_params"][1] + 1) / 2
+        task = self.current_task
+        data_bits = task["size_mb"] * 1e6
+        data_bytes = data_bits / 8.0
+        cycles = data_bytes * task["complexity"]
+        local_cycles = (1.0 - alpha) * cycles
+        local_delay = local_cycles / task["local_cpu_hz"]
+        local_energy = self.energy_coefficient * local_cycles * task["local_cpu_hz"] ** 2
 
-        d_n = self.current_task["size"] * 1024 * 1024 / 8
-        c_n = self.current_task["complexity"]
-        t_due = self.current_task["deadline"]
-        tau_n = self.current_task["tau"]
+        mec_index = location if location < self.num_edges else int(
+            np.argmin(self.server_loads / self.edge_cpu_hz)
+        )
+        rate = self.bandwidth_hz * np.log2(
+            1.0 + self.tx_power_watt * self.channel_gains[mec_index] / self.noise_watt
+        )
+        radio_delay = alpha * data_bits / max(rate, 1.0)
+        radio_energy = self.tx_power_watt * radio_delay
+        offloaded_cycles = alpha * cycles
 
-        
-        t_local = ((1 - alpha) * d_n * c_n) / (self.C_local * 1e9) 
-        e_local = 1e-27 * ((1 - alpha) * d_n * c_n) * (self.C_local * 1e9) ** 2
+        if location < self.num_edges:
+            allocated_cpu = max(beta, 1e-3) * self.edge_cpu_hz[mec_index]
+            remote_delay = offloaded_cycles / allocated_cpu
+            remote_energy = remote_delay * self.edge_power_watt[mec_index] * beta
+            backhaul_delay = 0.0
+            self.server_loads[mec_index] += offloaded_cycles
+        else:
+            backhaul_delay = alpha * data_bits / self.backhaul_rate_bps
+            remote_delay = offloaded_cycles / self.cloud_cpu_hz
+            remote_energy = self.backhaul_power_watt * backhaul_delay
 
-        total_time = t_local
-        total_energy = e_local
+        total_delay = max(local_delay, radio_delay + backhaul_delay + remote_delay)
+        total_energy = local_energy + radio_energy + remote_energy
+        deadline = task["deadline"]
+        priority = task["priority"]
+        success = total_delay <= deadline
+        normalized_overdue = max(0.0, total_delay - deadline) / (deadline + 1e-8)
+        utilization = self.server_loads / (
+            self.edge_cpu_hz * self.time_step_duration + 1e-8
+        )
+        average_utilization = np.mean(utilization)
+        load_imbalance = np.mean(
+            ((utilization - average_utilization) / (average_utilization + 1e-8)) ** 2
+        )
+        reward = (
+            float(success) * (self.completion_reward + self.priority_weight * priority)
+            - self.delay_weight
+            * (self.base_overdue_penalty + self.priority_weight * priority)
+            * normalized_overdue
+            - self.energy_weight * total_energy
+            - self.load_balance_weight * load_imbalance
+        )
 
-        if location > 0:  
-            m_idx = location - 1
-            t_comm = (alpha * d_n) / (self.B_up * 0.125)
-            e_comm = 0.2 * t_comm  # p_max = 0.2W
-            allocated_c = self.C_edges[m_idx] * max(beta, 0.01)
-            t_mec = (alpha * d_n) / allocated_c
-            e_mec = t_mec * 0.5 * beta  
-            total_time = max(t_local, t_comm + t_mec)
-            total_energy += (e_comm + e_mec)
-            self.server_loads[m_idx] += (alpha * d_n)
-
-        
-        epsilon = 1e-6
-
-        
-        is_completed = 1 if total_time <= t_due else 0
-        r_comp = is_completed * (self.R_base + self.w_tau * tau_n)
-
-        delta_n = max(0, (total_time - t_due) / (t_due + epsilon))
-        r_overdue = (self.P_base + self.w_tau * tau_n) * delta_n
-
-        
-        u_m = self.server_loads / (self.C_edges * 10 + epsilon)
-        u_avg = np.mean(u_m)
-        l_imb = np.mean(((u_m - u_avg) / (u_avg + epsilon)) ** 2)
-
-        reward = r_comp - (self.w_O * r_overdue) - (self.w_E * total_energy) - (self.w_L * l_imb)
-
-       
         self.episode_step += 1
         done = self.episode_step >= self.max_steps_per_episode
+        info = {
+            "is_success": bool(success),
+            "delay_s": float(total_delay),
+            "energy_j": float(total_energy),
+            "priority": float(priority),
+            "task_type": int(task["task_type"]),
+            "location": location,
+            "alpha": float(alpha),
+            "beta": float(beta),
+        }
         self._get_next_task()
-        next_state = self._get_state()
-
-        return next_state, reward, done, {"is_success": is_completed}
+        if self.episode_step % self.num_devices == 0:
+            self._refresh_channel_gains()
+        return self._get_state(), float(reward), done, info

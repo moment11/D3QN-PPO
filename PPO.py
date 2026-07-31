@@ -6,14 +6,11 @@ from torch.distributions import Categorical
 ################################## set device ##################################
 from torch.optim.lr_scheduler import StepLR
 
-print("============================================================================================")
-if(torch.cuda.is_available()): 
+if torch.cuda.is_available():
     device = torch.device('cuda:0') 
     torch.cuda.empty_cache()
-    print("Device set to : " + str(torch.cuda.get_device_name(device)))
 else:
-    print("Device set to : cpu")
-print("============================================================================================")
+    device = torch.device('cpu')
 
 
 ################################## PPO Policy ##################################
@@ -52,7 +49,7 @@ class ActorCritic(nn.Module):
                             nn.Linear(64, 64),
                             nn.Tanh(),
                             nn.Linear(64, action_dim),
-                            nn.Tanh()
+                            nn.Sigmoid()
                         )
         else:
             self.actor = nn.Sequential(
@@ -83,7 +80,7 @@ class ActorCritic(nn.Module):
     def forward(self):
         raise NotImplementedError
     
-    def act(self, state):
+    def act(self, state, deterministic=False):
 
         if self.has_continuous_action_space:
             action_mean = self.actor(state)
@@ -93,7 +90,9 @@ class ActorCritic(nn.Module):
             action_probs = self.actor(state)
             dist = Categorical(action_probs)
 
-        action = dist.sample()
+        action = action_mean if deterministic and self.has_continuous_action_space else dist.sample()
+        if self.has_continuous_action_space:
+            action = torch.clamp(action, 0.0, 1.0)
         action_logprob = dist.log_prob(action)
         state_val = self.critic(state)
 
@@ -122,7 +121,7 @@ class ActorCritic(nn.Module):
 
 
 class PPO:
-    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std_init=0.6):
+    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, k_epochs, eps_clip, has_continuous_action_space, action_std_init=0.6):
 
         self.has_continuous_action_space = has_continuous_action_space
 
@@ -131,7 +130,7 @@ class PPO:
 
         self.gamma = gamma
         self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
+        self.k_epochs = k_epochs
         
         self.buffer = RolloutBuffer()
 
@@ -139,12 +138,12 @@ class PPO:
         self.optimizer = torch.optim.Adam([
                         {'params': self.policy.actor.parameters(), 'lr': lr_actor},
                         {'params': self.policy.critic.parameters(), 'lr': lr_critic}
-                    ])
+                    ], lr=lr_actor, weight_decay=0.0)
         self.scheduler = StepLR(self.optimizer, step_size=100, gamma=0.9)
         self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
-        self.MseLoss = nn.MSELoss()
+        self.mse_loss = nn.MSELoss()
 
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
@@ -172,17 +171,20 @@ class PPO:
             print("WARNING : Calling PPO::decay_action_std() on discrete action space policy")
         print("--------------------------------------------------------------------------------------------")
 
-    def select_action(self, state):
+    def select_action(self, state, record=True, deterministic=False):
 
         if self.has_continuous_action_space:
             with torch.no_grad():
                 state = torch.FloatTensor(state).to(device)
-                action, action_logprob, state_val = self.policy_old.act(state)
+                action, action_logprob, state_val = self.policy_old.act(
+                    state, deterministic=deterministic
+                )
 
-            self.buffer.states.append(state)
-            self.buffer.actions.append(action)
-            self.buffer.logprobs.append(action_logprob)
-            self.buffer.state_values.append(state_val)
+            if record:
+                self.buffer.states.append(state)
+                self.buffer.actions.append(action)
+                self.buffer.logprobs.append(action_logprob)
+                self.buffer.state_values.append(state_val)
 
             return action.detach().cpu().numpy().flatten()
         else:
@@ -198,17 +200,18 @@ class PPO:
             return action.item()
 
     def update(self):
+        if not self.buffer.rewards:
+            return None
         # Monte Carlo estimate of returns
-        rewards = []
         advantages = []
-        gae = 0
+        gae = 0.0
         for i in reversed(range(len(self.buffer.rewards))):
             reward = self.buffer.rewards[i]
             is_terminal = self.buffer.is_terminals[i]
-            state_value = self.buffer.state_values[i]
-            next_state_value = 0
+            state_value = float(self.buffer.state_values[i].item())
+            next_state_value = 0.0
             if i < len(self.buffer.rewards) - 1:
-                next_state_value = self.buffer.state_values[i + 1]
+                next_state_value = float(self.buffer.state_values[i + 1].item())
 
             if is_terminal:
                 td_error = reward - state_value
@@ -222,25 +225,31 @@ class PPO:
             advantages.insert(0, gae)
 
         
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
         
-        old_state_values_tensor = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
+        old_state_values_tensor = torch.stack(
+            self.buffer.state_values, dim=0
+        ).reshape(-1).detach().to(device)
         returns = advantages + old_state_values_tensor
 
         
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-7
+        )
 
         
 
         
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
+        old_states = torch.stack(self.buffer.states, dim=0).detach().to(device)
+        old_actions = torch.stack(self.buffer.actions, dim=0).detach().to(device)
+        old_logprobs = torch.stack(
+            self.buffer.logprobs, dim=0
+        ).reshape(-1).detach().to(device)
 
        
-        for _ in range(self.K_epochs):
+        for _ in range(self.k_epochs):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
-            state_values = torch.squeeze(state_values)
+            state_values = state_values.reshape(-1)
             ratios = torch.exp(logprobs - old_logprobs.detach())
 
             
@@ -249,7 +258,7 @@ class PPO:
 
             
             
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, returns) - 0.01 * dist_entropy
+            loss = -torch.min(surr1, surr2) + 0.5 * self.mse_loss(state_values, returns) - 0.01 * dist_entropy
 
             self.optimizer.zero_grad()
             loss.mean().backward()
@@ -260,6 +269,7 @@ class PPO:
 
         
         self.scheduler.step()
+        return {"ppo_loss": float(loss.mean().item())}
         # discounted_reward = 0
         # for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
         #     if is_terminal:
@@ -314,8 +324,9 @@ class PPO:
         torch.save(self.policy_old.state_dict(), checkpoint_path)
    
     def load(self, checkpoint_path):
-        self.policy_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
-        self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        self.policy_old.load_state_dict(state_dict)
+        self.policy.load_state_dict(state_dict)
         
         
        
